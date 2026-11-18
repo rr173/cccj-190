@@ -42,3 +42,22 @@ class BuildError(CatalogError):
 
 class QueryError(CatalogError):
     """Invalid query parameters (non-finite coords, bad rect, bad k)."""
+
+
+class CrossTableError(CatalogError):
+    """Line/zone cross-table build, validation or open failure.
+
+    Carries an optional structured evidence path (rejects/diagnostics
+    written next to the failed build directory).
+    """
+
+    def __init__(self, message, evidence_path=None, reason=None, detail=None):
+        super().__init__(message)
+        self.evidence_path = evidence_path
+        self.reason = reason
+        self.detail = detail
+
+
+class SpillBudgetExceeded(CrossTableError):
+    """The explicit on-disk spill budget was exhausted; no partial output
+    is published."""

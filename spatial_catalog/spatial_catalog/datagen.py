@@ -139,3 +139,126 @@ def write_jsonl(path, records):
         for rec in records:
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
     return path
+
+
+# -------------------------------------------- cross-table generators
+
+def _polygon(ring, holes=()):
+    return {"type": "Polygon", "coordinates": [ring] + list(holes)}
+
+
+def _multiline(parts):
+    return {"type": "MultiLineString",
+            "coordinates": [[list(c) for c in part] for part in parts]}
+
+
+def _multipolygon(polys):
+    return {"type": "MultiPolygon",
+            "coordinates": [p["coordinates"] for p in polys]}
+
+
+def gen_xtab_sparse(n_lines, n_zones, seed=11, grid=1000.0):
+    """Sparse, mostly disjoint scene: small squares on a wide grid and
+    short lines nearby, so bbox pruning removes most pairs.  Includes
+    holes, MultiLineStrings and MultiPolygons."""
+    rng = random.Random(seed)
+    lines, zones = [], []
+    side = max(1, int(max(n_lines, n_zones) ** 0.5) + 1)
+    cell = grid / side
+    for i in range(n_zones):
+        gx, gy = divmod(i, side)
+        cx = gx * cell + 0.5 * cell + rng.uniform(-0.1, 0.1) * cell
+        cy = gy * cell + 0.5 * cell + rng.uniform(-0.1, 0.1) * cell
+        r = rng.uniform(0.05, 0.18) * cell
+        if i % 7 == 3:
+            sq1 = _square(cx, cy, r)
+            sq2 = _square(cx + 3 * r, cy, r * 0.8)
+            zones.append({"object_id": "z-%08d" % i,
+                          "geometry": _multipolygon([sq1, sq2])})
+        else:
+            hole = 0.45 if i % 5 == 2 else 0.0
+            zones.append({"object_id": "z-%08d" % i,
+                          "geometry": _square(cx, cy, r, hole_ratio=hole)})
+    for i in range(n_lines):
+        gx, gy = divmod(i, side)
+        cx = gx * cell + 0.5 * cell + rng.uniform(-0.2, 0.2) * cell
+        cy = gy * cell + 0.5 * cell + rng.uniform(-0.2, 0.2) * cell
+        length = rng.uniform(0.1, 0.6) * cell
+        angle = rng.uniform(0, 6.2831853)
+        coords = [(cx - 0.5 * length * _cos(angle),
+                   cy - 0.5 * length * _sin(angle)),
+                  (cx, cy),
+                  (cx + 0.5 * length * _cos(angle),
+                   cy + 0.5 * length * _sin(angle))]
+        if i % 6 == 4:
+            lines.append({"object_id": "l-%08d" % i,
+                          "geometry": _multiline([coords[:2], coords[1:]])})
+        else:
+            lines.append({"object_id": "l-%08d" % i, "geometry": _line(coords)})
+    rng.shuffle(lines)
+    rng.shuffle(zones)
+    return lines, zones
+
+
+def _cos(x):
+    import math
+    return math.cos(x)
+
+
+def _sin(x):
+    import math
+    return math.sin(x)
+
+
+def gen_xtab_full_overlap(n_lines, n_zones, seed=12, span=100.0):
+    """Degenerate worst case: every zone polygon covers the shared central
+    box and every line crosses it, so every line x zone pair has positive
+    intersection length: bbox pruning cannot remove a single candidate."""
+    rng = random.Random(seed)
+    zones = []
+    for j in range(n_zones):
+        # all polygons contain [-5,5] x [-5,5]; randomised outer corners
+        x0 = rng.uniform(-span, -5.0)
+        y0 = rng.uniform(-span, -5.0)
+        x1 = rng.uniform(5.0, span)
+        y1 = rng.uniform(5.0, span)
+        ring = [[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]]
+        zones.append({"object_id": "zo-%08d" % j,
+                      "geometry": {"type": "Polygon", "coordinates": [ring]}})
+    lines = []
+    for i in range(n_lines):
+        mx, my = rng.uniform(-4.0, 4.0), rng.uniform(-4.0, 4.0)
+        lines.append({"object_id": "lo-%08d" % i, "geometry": _line([
+            (rng.uniform(-span, -6.0), rng.uniform(-span, -6.0)),
+            (mx, my),
+            (rng.uniform(6.0, span), rng.uniform(6.0, span))])})
+    rng.shuffle(lines)
+    rng.shuffle(zones)
+    return lines, zones
+
+
+def gen_xtab_unicode_ids(seed=13):
+    """Mixed Unicode ids to pin code point ordering (CJK, accented,
+    Greek, right-to-left)."""
+    rng = random.Random(seed)
+
+    def rect(x0, y0, x1, y1):
+        return {"type": "Polygon",
+                "coordinates": [[[x0, y0], [x1, y0], [x1, y1],
+                                 [x0, y1], [x0, y0]]]}
+
+    zones = [
+        {"object_id": "区域-α", "geometry": rect(0, 0, 10, 10)},
+        {"object_id": "zone-01", "geometry": rect(5, 5, 15, 15)},
+        {"object_id": "Ωmega", "geometry": rect(-5, -5, 4, 4)},
+        {"object_id": "zöne", "geometry": rect(20, 20, 30, 30)},
+    ]
+    lines = [
+        {"object_id": "线-1", "geometry": _line([(-2, 2), (12, 2)])},
+        {"object_id": "line-乙", "geometry": _line([(6, 6), (14, 14)])},
+        {"object_id": "åline", "geometry": _line([(21, 25), (29, 25)])},
+        {"object_id": "latin", "geometry": _line([(-4, -4), (3, 3)])},
+    ]
+    rng.shuffle(lines)
+    rng.shuffle(zones)
+    return lines, zones

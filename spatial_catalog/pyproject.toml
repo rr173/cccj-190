@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "spatial-catalog"
-version = "1.0.0"
-description = "Disk-resident packed spatial index (Hilbert R-tree) for offline GeoJSON boundary/line datasets"
+version = "1.1.0"
+description = "Disk-resident packed spatial index (Hilbert R-tree) and line/zone length-attribution cross-table for offline GeoJSON datasets"
 requires-python = ">=3.9"
 dependencies = ["shapely>=1.8"]
 

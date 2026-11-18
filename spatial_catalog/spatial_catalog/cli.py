@@ -7,6 +7,11 @@
   python -m spatial_catalog validate --catalog CAT
   python -m spatial_catalog diag    --out DIR [--n N] [--cache-bytes B]
 
+  python -m spatial_catalog xtab build    --lines CAT --zones CAT --out XT [opts]
+  python -m spatial_catalog xtab validate --crosstab XT [--lines CAT] [--zones CAT]
+  python -m spatial_catalog xtab info     --crosstab XT
+  python -m spatial_catalog xtab diag     --out DIR [options]
+
 All query commands print a single JSON document including real traversal
 statistics.  Exit codes: 0 ok, 2 expected failure (build rejects, bad
 query, corrupt catalog), 1 unexpected error.
@@ -19,7 +24,7 @@ import sys
 from . import format as fmt
 from .builder import build
 from .catalog import Catalog
-from .errors import BuildError, CatalogError
+from .errors import BuildError, CatalogError, CrossTableError
 
 
 def _print(obj):
@@ -88,6 +93,46 @@ def cmd_diag(args):
     return 0
 
 
+# ------------------------------------------------------- cross-table CLI
+
+def cmd_xtab_build(args):
+    from .xtab import build_crosstab
+    report = build_crosstab(
+        args.lines, args.zones, args.out,
+        cache_bytes=args.cache_bytes,
+        max_spill_bytes=args.max_spill_bytes, force=args.force,
+        log=lambda *a: print(*a, file=sys.stderr))
+    _print(report)
+    return 0
+
+
+def cmd_xtab_validate(args):
+    from .xreader import XTable
+    with XTable(args.crosstab) as xt:
+        result = xt.validate_full(
+            line_catalog=args.lines if args.lines else None,
+            zone_catalog=args.zones if args.zones else None)
+    _print(result)
+    return 0
+
+
+def cmd_xtab_info(args):
+    from .xreader import XTable
+    with XTable(args.crosstab) as xt:
+        _print(xt.manifest)
+    return 0
+
+
+def cmd_xtab_diag(args):
+    from .xdiag import run_xtab_diag
+    _print(run_xtab_diag(args.out, n_lines=args.n_lines,
+                         n_zones=args.n_zones,
+                         cache_bytes=args.cache_bytes,
+                         max_spill_bytes=args.max_spill_bytes,
+                         seed=args.seed))
+    return 0
+
+
 def make_parser():
     p = argparse.ArgumentParser(
         prog="spatial_catalog",
@@ -146,6 +191,47 @@ def make_parser():
     d.add_argument("--cache-bytes", type=int, default=8 << 20)
     d.add_argument("--seed", type=int, default=7)
     d.set_defaults(func=cmd_diag)
+
+    # ---- cross-table -------------------------------------------------
+    x = sub.add_parser("xtab", help="line/zone length-attribution "
+                                    "cross-table commands")
+    xsub = x.add_subparsers(dest="xtab_command", required=True)
+
+    xb = xsub.add_parser("build", help="build the line/zone cross-table "
+                                       "from two committed catalogs")
+    xb.add_argument("--lines", required=True, help="line catalog directory")
+    xb.add_argument("--zones", required=True, help="zone catalog directory")
+    xb.add_argument("--out", required=True, help="cross-table output directory")
+    xb.add_argument("--cache-bytes", type=int, default=64 << 20,
+                    help="in-memory budget: sort chunk + page cache")
+    xb.add_argument("--max-spill-bytes", type=int, default=1 << 30,
+                    help="hard on-disk spill budget; exhaustion fails the "
+                         "build instead of truncating candidates")
+    xb.add_argument("--force", action="store_true")
+    xb.set_defaults(func=cmd_xtab_build)
+
+    xv = xsub.add_parser("validate", help="full cross-table validation: "
+                                          "hashes, order, numerics, uniqueness")
+    xv.add_argument("--crosstab", required=True)
+    xv.add_argument("--lines", help="line catalog path (defaults to the "
+                                    "path pinned in the manifest)")
+    xv.add_argument("--zones", help="zone catalog path (defaults to the "
+                                    "path pinned in the manifest)")
+    xv.set_defaults(func=cmd_xtab_validate)
+
+    xi = xsub.add_parser("info", help="print the cross-table manifest")
+    xi.add_argument("--crosstab", required=True)
+    xi.set_defaults(func=cmd_xtab_info)
+
+    xd = xsub.add_parser("diag", help="runtime-generated sparse/overlap "
+                                      "cross-table diagnostics vs oracle")
+    xd.add_argument("--out", required=True)
+    xd.add_argument("--n-lines", type=int, default=4000)
+    xd.add_argument("--n-zones", type=int, default=1000)
+    xd.add_argument("--cache-bytes", type=int, default=4 << 20)
+    xd.add_argument("--max-spill-bytes", type=int, default=1 << 30)
+    xd.add_argument("--seed", type=int, default=21)
+    xd.set_defaults(func=cmd_xtab_diag)
     return p
 
 
@@ -155,6 +241,9 @@ def main(argv=None):
         return args.func(args)
     except BuildError as exc:
         print("build failed: %s" % exc, file=sys.stderr)
+        return 2
+    except CrossTableError as exc:
+        print("cross-table failed: %s" % exc, file=sys.stderr)
         return 2
     except CatalogError as exc:
         print("error: %s" % exc, file=sys.stderr)

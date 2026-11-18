@@ -68,12 +68,16 @@ def _quiet_unlink(path):
         pass
 
 
-def external_sort(records, key_fn, chunk_bytes, tmpdir, tag="sort", fanin=32):
+def external_sort(records, key_fn, chunk_bytes, tmpdir, tag="sort", fanin=32,
+                  on_flush=None):
     """Sort an iterable of byte records without holding them all in memory.
 
     records:     iterable of bytes
     key_fn:      bytes -> comparable key
     chunk_bytes: in-memory run budget; exceeded -> spill a sorted run
+    on_flush:    optional callback(path, n_records) invoked every time a
+                 run is materialised on disk (diagnostics use it to count
+                 real spills instead of guessing)
     returns:     iterator over records in key order
     """
     os.makedirs(tmpdir, exist_ok=True)
@@ -91,6 +95,8 @@ def external_sort(records, key_fn, chunk_bytes, tmpdir, tag="sort", fanin=32):
         n_run += 1
         _write_run(buf, path)
         runs.append(path)
+        if on_flush is not None:
+            on_flush(path, len(buf))
         buf = []
         buf_bytes = 0
 

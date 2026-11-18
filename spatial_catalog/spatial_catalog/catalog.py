@@ -397,6 +397,60 @@ class Catalog:
                 lower = _bbox_mindist(x, y, e[:4])
                 pq.push(lower, b"L" + _pack_leaf_ref(e[4], e[5]))
 
+    # ---------------------------------------------------- streaming scans
+
+    def iter_leaf_entries(self):
+        """Stream every leaf entry (bbox, payload_off, payload_len) in
+        physical page order.
+
+        One page is held at a time plus the LRU cache, so the working set
+        is bounded by the configured page cache, never by object count.
+        Used by the cross-table builder to drive an outer loop without
+        loading a catalog into memory.
+        """
+        self._check_open()
+        for page_no in range(self._page_count):
+            _kind, entries = self._read_page(page_no)
+            if _kind == fmt.PAGE_KIND_LEAF:
+                for e in entries:
+                    yield e
+
+    def iter_payloads(self):
+        """Stream (object_id, shapely_geometry) for every object in the
+        catalog, decoding each payload once and releasing it immediately."""
+        for e in self.iter_leaf_entries():
+            yield self._read_payload(e[4], e[5])
+
+    def bbox_window_entries(self, bbox, stats=None):
+        """Candidate enumeration by *bounding box only*.
+
+        Yields (payload_off, payload_len) for leaf entries whose stored
+        bbox intersects the closed bbox.  No geometry is decoded and no
+        exact predicate runs here: callers own the exact computation.
+        The R-tree prunes internal pages the same way window() does, so a
+        sparse dataset touches far fewer pages than a full scan.  ``stats``
+        is mutated in place (nodes_visited; pq_pushed reused as the bbox
+        candidate counter).
+        """
+        self._check_open()
+        stats = stats or QueryStats()
+        minx, miny, maxx, maxy = bbox
+        stack = [self._root_page]
+        while stack:
+            page_no = stack.pop()
+            kind, entries = self._read_page(page_no)
+            stats.nodes_visited += 1
+            if kind == fmt.PAGE_KIND_INTERNAL:
+                for e in entries:
+                    if e[0] <= maxx and e[2] >= minx and e[1] <= maxy and e[3] >= miny:
+                        stack.append(e[4])
+            else:
+                for e in entries:
+                    if e[0] <= maxx and e[2] >= minx and e[1] <= maxy and e[3] >= miny:
+                        stats.pq_pushed += 1  # reused as "bbox candidates"
+                        yield e[4], e[5]
+        return stats
+
     # ------------------------------------------------------------ validate
 
     def validate_full(self):

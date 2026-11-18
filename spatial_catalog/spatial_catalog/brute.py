@@ -50,3 +50,37 @@ def nearest_scan(records, x, y, k):
     scored = [(geom.distance(point), oid) for oid, geom in records]
     scored.sort(key=lambda t: (t[0], t[1]))
     return [(oid, dist) for dist, oid in scored[:k]]
+
+
+# ------------------------------------------------- cross-table oracle
+
+def crosstab_scan(line_records, zone_records):
+    """Independent correctness oracle for the line/zone cross-table.
+
+    Naive O(L*Z) double full scan using ONLY Shapely single-geometry
+    intersection and length.  It never opens a catalog, never touches the
+    R-tree, pruning, external sort or dedupe production code.  Returns the
+    complete expected set of rows as
+    (source_id, zone_id, intersect_length, source_length, ratio) tuples
+    sorted by (source_id, zone_id) -- exactly the production row order.
+
+    The same semantics are re-derived here from scratch: a pair appears
+    only when the intersection has a strictly positive 1-D length, and the
+    ratio is the float64 quotient of the two GEOS planar lengths.
+    """
+    rows = []
+    for source_id, line_geom in line_records:
+        source_length = float(line_geom.length)
+        for zone_id, zone_geom in zone_records:
+            intersect_length = float(line_geom.intersection(zone_geom).length)
+            if intersect_length > 0.0:
+                rows.append((source_id, zone_id, intersect_length,
+                             source_length,
+                             intersect_length / source_length))
+    rows.sort(key=lambda r: (r[0], r[1]))
+    return rows
+
+
+def crosstab_rows_from_jsonl(line_path, zone_path):
+    """Convenience: run the oracle straight from the two JSONL inputs."""
+    return crosstab_scan(load_records(line_path), load_records(zone_path))
