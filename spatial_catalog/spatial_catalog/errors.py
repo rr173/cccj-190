@@ -61,3 +61,23 @@ class CrossTableError(CatalogError):
 class SpillBudgetExceeded(CrossTableError):
     """The explicit on-disk spill budget was exhausted; no partial output
     is published."""
+
+
+class TopologyError(CatalogError):
+    """Line-topology build, validation or open failure.
+
+    Carries an optional structured evidence path (reject/diagnostic files
+    written next to the failed build directory) so every bad record is
+    locatable by source id and part position.
+    """
+
+    def __init__(self, message, evidence_path=None, reason=None, detail=None):
+        super().__init__(message)
+        self.evidence_path = evidence_path
+        self.reason = reason
+        self.detail = detail
+
+
+class TopologySpillBudgetExceeded(TopologyError):
+    """The topology build's explicit on-disk spill budget was exhausted;
+    no partial network is published."""

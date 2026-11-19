@@ -24,7 +24,8 @@ import sys
 from . import format as fmt
 from .builder import build
 from .catalog import Catalog
-from .errors import BuildError, CatalogError, CrossTableError
+from .errors import (BuildError, CatalogError, CrossTableError,
+                     TopologyError)
 
 
 def _print(obj):
@@ -133,6 +134,46 @@ def cmd_xtab_diag(args):
     return 0
 
 
+# ------------------------------------------------------------- topology CLI
+
+def cmd_topo_build(args):
+    from .topo import Selection, build_topology
+    selection = Selection(ids_file=args.ids_file, id_prefixes=args.id_prefix)
+    report = build_topology(
+        args.catalog, args.out, selection=selection,
+        exclude_non_lines=args.exclude_non_lines,
+        cache_bytes=args.cache_bytes,
+        max_spill_bytes=args.max_spill_bytes, force=args.force,
+        log=lambda *a: print(*a, file=sys.stderr))
+    _print(report)
+    return 0
+
+
+def cmd_topo_validate(args):
+    from .treader import Topology
+    with Topology(args.topology) as topo:
+        result = topo.validate_full(
+            catalog=False if args.no_catalog else (args.catalog or None))
+    _print(result)
+    return 0
+
+
+def cmd_topo_info(args):
+    from .treader import Topology
+    with Topology(args.topology) as topo:
+        _print(topo.manifest)
+    return 0
+
+
+def cmd_topo_diag(args):
+    from .tdiag import run_topo_diag
+    _print(run_topo_diag(args.out, n=args.n, big=args.big,
+                         cache_bytes=args.cache_bytes,
+                         max_spill_bytes=args.max_spill_bytes,
+                         seed=args.seed))
+    return 0
+
+
 def make_parser():
     p = argparse.ArgumentParser(
         prog="spatial_catalog",
@@ -232,6 +273,62 @@ def make_parser():
     xd.add_argument("--max-spill-bytes", type=int, default=1 << 30)
     xd.add_argument("--seed", type=int, default=21)
     xd.set_defaults(func=cmd_xtab_diag)
+
+    # ---- line topology ------------------------------------------------
+    t = sub.add_parser("topo", help="line-facility node/edge topology "
+                                    "network commands")
+    tsub = t.add_subparsers(dest="topo_command", required=True)
+
+    tb = tsub.add_parser("build", help="extract the node-edge network from "
+                                       "a committed catalog (exact end-point "
+                                       "matching, disk bounded)")
+    tb.add_argument("--catalog", required=True, help="input catalog directory")
+    tb.add_argument("--out", required=True, help="topology output directory")
+    tb.add_argument("--ids-file",
+                    help="UTF-8 text file of selected object_ids (one per "
+                         "line, '#' comments and blank lines allowed)")
+    tb.add_argument("--id-prefix", action="append", default=[],
+                    dest="id_prefix",
+                    help="select object_ids with this prefix (repeatable)")
+    tb.add_argument("--exclude-non-lines", action="store_true",
+                    help="non-line selected records are excluded and "
+                         "summarized instead of failing the build")
+    tb.add_argument("--cache-bytes", type=int, default=64 << 20,
+                    help="in-memory budget: sort chunks and union-find pages")
+    tb.add_argument("--max-spill-bytes", type=int, default=1 << 30,
+                    help="hard on-disk spill budget; exhaustion fails the "
+                         "build instead of truncating the network")
+    tb.add_argument("--force", action="store_true")
+    tb.set_defaults(func=cmd_topo_build)
+
+    tv = tsub.add_parser("validate", help="full topology validation: "
+                                          "hashes, keys, degrees, references, "
+                                          "independent component closure")
+    tv.add_argument("--topology", required=True)
+    tv.add_argument("--catalog", help="source catalog path (defaults to the "
+                                      "path pinned in the manifest)")
+    tv.add_argument("--no-catalog", action="store_true",
+                    help="skip the optional source catalog re-identity and "
+                         "deep geometry consistency check")
+    tv.set_defaults(func=cmd_topo_validate)
+
+    ti = tsub.add_parser("info", help="print the topology manifest")
+    ti.add_argument("--topology", required=True)
+    ti.set_defaults(func=cmd_topo_info)
+
+    td = tsub.add_parser(
+        "diag", aliases=("diagnose",),
+        help="runtime-generated topology diagnostics: many small "
+             "components + one giant component, oracle diff "
+             "('diagnose' is an alias)")
+    td.add_argument("--out", required=True)
+    td.add_argument("--n", type=int, default=6000)
+    td.add_argument("--big", type=int, default=1500,
+                    help="size of the single giant connected component")
+    td.add_argument("--cache-bytes", type=int, default=1 << 20)
+    td.add_argument("--max-spill-bytes", type=int, default=1 << 30)
+    td.add_argument("--seed", type=int, default=31)
+    td.set_defaults(func=cmd_topo_diag)
     return p
 
 
@@ -244,6 +341,9 @@ def main(argv=None):
         return 2
     except CrossTableError as exc:
         print("cross-table failed: %s" % exc, file=sys.stderr)
+        return 2
+    except TopologyError as exc:
+        print("topology failed: %s" % exc, file=sys.stderr)
         return 2
     except CatalogError as exc:
         print("error: %s" % exc, file=sys.stderr)

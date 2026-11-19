@@ -2,7 +2,7 @@
 facilities: packed Hilbert R-tree over JSONL/GeoJSON input, plus a
 line/zone boundary-length attribution cross-table builder."""
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 from .builder import build          # noqa: F401
 from .catalog import Catalog        # noqa: F401
@@ -12,3 +12,5 @@ from .errors import (BuildError, CatalogError, CorruptionError,   # noqa: F401
                      SpillBudgetExceeded, UnsupportedVersionError)
 from .xtab import build_crosstab    # noqa: F401
 from .xreader import XTable         # noqa: F401
+from .topo import Selection, build_topology  # noqa: F401
+from .treader import Topology       # noqa: F401

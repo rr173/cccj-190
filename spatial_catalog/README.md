@@ -48,6 +48,21 @@ python3 -m spatial_catalog xtab info     --crosstab xt
 python3 -m spatial_catalog xtab diag --out /tmp/xtab-diag \
     --n-lines 4000 --n-zones 1000
 
+# ===== 线设施节点—边拓扑网络 =====
+# 从一份已构建目录抽取可直接检查连接关系的网络（不是邻近/框选查询，也不是
+# 区域交叠报表）。原目录只读打开，绝不被修改。
+python3 -m spatial_catalog topo build \
+    --catalog cat --out topo \
+    --cache-bytes 8388608 --max-spill-bytes 1073741824 --force
+# 仅处理选定对象（可选：--ids-file 名单、--id-prefix 前缀，可重复）
+python3 -m spatial_catalog topo build --catalog cat --out topo-sel \
+    --ids-file selected.txt --id-prefix net- \
+    --exclude-non-lines --force
+python3 -m spatial_catalog topo validate --topology topo
+python3 -m spatial_catalog topo info     --topology topo
+python3 -m spatial_catalog topo diag     --out /tmp/topo-diag \
+    --n 6000 --big 1500      # diagnose 是 diag 的别名
+
 # 测试
 python3 -m pytest
 ```
@@ -281,3 +296,144 @@ SHA-256、`peak_rss_bytes`、`duration_s`。
 生产候选枚举/剪枝/归并代码。`tests/test_xtab_differential.py` 对随机小
 目录逐行、逐数值差分；规模数据全部运行时生成，不提交大型生成物。
 
+
+---
+
+# 线设施节点—边拓扑网络（topo）
+
+`window`/`nearest` 回答“哪些 id 命中”，交叉表回答“每段长度归属哪个区域”，
+但都无法回答“哪些设施端头相接、网络分成几块、每块包含哪些原始线部件”。
+`topo` 把目录里的线设施固化成一份**可直接检查连接关系的节点—边网络**，
+而不是又一种查询或报表。
+
+## 连接语义（合同的核心）
+
+* 只有 `LineString`/`MultiLineString` 转成边。`MultiLineString` 按**部件
+  序号**拆成多条边，每条边保留来源 `object_id` 与 0 基部件号，因此每个
+  部件都可回溯到同一来源对象。
+* 一条边只以其**首、尾位置**建立连接端。两个端头在平面二维坐标上
+  **数值精确相等**（float64 位相等，`-0.0 == +0.0` 归一）才共用一个节点。
+* **没有容差吸附、没有坐标变换、不插入新顶点**：交叉、重叠、相切，或一个
+  端头落在另一条线的**内部**，都不产生连接、也不新增顶点。
+* **零长度部件**作为自环合法存在：首末端引用同一节点，该节点的端头关联数
+  （度数）**增加两次**。
+* **重复线仍是两条独立来源边**：它们共用端点节点，但各自是独立的边行。
+* 类型不符的记录遵循显式拒收策略：默认整体失败并写证据；加
+  `--exclude-non-lines` 时改为排除并在 `selection.jsonl` 与清单计数中留痕。
+  被 `--ids-file`/`--id-prefix` 明确排除的记录同样写入运行摘要。
+* 错误几何、空部件、无效引用或损坏载荷**绝不静默忽略**；错误信息带
+  来源 id 与部件位置（`object_id`、`part`、`position`）。
+
+## 输出目录（版本化、原子提交）
+
+```
+topo/
+  topo_manifest.json  # 提交点：格式版本、输入目录内容摘要（身份）、
+                      #   选择规则、计数、各结果文件长度 + SHA-256（最后原子写入）
+  nodes.tsv           # 节点表（两行固定头 + 数据行），按节点键排序
+  edges.tsv           # 边表（两行固定头 + 数据行），按 (source_id, part)
+                      #   Unicode 码点序排序
+  selection.jsonl     # 每个未成为边的被扫描记录及原因
+  build_report.json   # 全部为实测计数的构建诊断
+```
+
+节点数据行：
+
+```
+node_key ⇥ x ⇥ y ⇥ degree ⇥ incident_edges ⇥ component_key ⏎
+```
+
+* `node_key`：`N` + 12 位零填充十进制序号，序号按坐标 `(x,y)` 字典序分配；
+* `degree`：连到该节点的**边端数**（自环计两次）；
+* `incident_edges`：邻边来源引用，形如 `E000000000003@S`（`@S` 首端、
+  `@T` 末端），按 `(edge_key, 端)` 严格排序；
+* `component_key`：`C` + 该分量中最小节点的序号。
+
+边数据行：
+
+```
+edge_key ⇥ source_id ⇥ part_index ⇥ from_node ⇥ to_node ⇥ geometry
+         ⇥ planar_length ⇥ component_key ⏎
+```
+
+* `edge_key`：`E` + 12 位零填充序号，序号即边在排序表中的位置；
+* `from_node`/`to_node`：首尾节点键；自环时二者相同；
+* `geometry`：**完整原始坐标序列**的规范 `LINESTRING(...)` 文本（不是仅一个
+  引用），可对照源目录逐坐标核验；数值用 Python `repr(float64)`，与
+  locale 无关、可精确往返；
+* `planar_length`：对原始序列逐段 `hypot` 求和的平面长度（零长度部件为
+  `0.0`），校验时按位重算；
+* 排序键是 id 的 UTF-8 字节，UTF-8 字节序与 Unicode 码点序一致，因此目录
+  物理布局、哈希种子或机器 locale 都不能改变结果；输入不变则多次运行的
+  行内容与摘要逐字节稳定。
+
+## 路线选择（满足合同的两种合规路线之一）
+
+| 路线 | 归节点 | 分量合并 |
+|---|---|---|
+| **甲（已选）端头外排序 + 磁盘并查** | 线部件两端写成记录，外部排序后按坐标归并 | 外部边表 + 驻磁盘的并查状态 |
+| 乙 磁盘关系库 | 坐标键与边关系写入关系库，唯一键归节点 | 邻接索引 + 磁盘队列遍历 |
+
+选择**甲**的理由：端头是天然的等长记录，外排序归并能在一趟流式合并里同时
+完成“精确相等归节点 + 度数统计”，无需维护任何随节点数增长的驻留映射；
+随后的分量闭包交给**驻磁盘并查集**（父/秩数组在定宽文件中，经有界 LRU
+页缓存访问），把外排序与并查两套机制都纳入同一个显式内存预算。被否决的伪
+方案：全内存 union-find（违反有界 RAM）、按距离容差擅自连边（违反精确相
+等）、限制每分量大小（破坏完整连通闭包）。
+
+### 阶段状态与内存/磁盘开销
+
+1. **phase 1 扫描**：流式读目录，一次驻留一个几何；写边记录与端头记录到
+   长度前缀原始文件。
+2. **phase 2 外排序**：边按 `(source_id, part)`、端头按 `(x,y)` 外排序
+   （分块受 `--cache-bytes` 约束，溢出落盘多路归并）；端头合并按位相等
+   分组，分配稳定节点序号与度数。
+3. **phase 3 连接回填**：节点—端关联重排序后，把节点序号合并回每条边，
+   写定宽平面边表。
+4. **phase 4 磁盘并查**：`tunion.py` 的父/秩数组驻文件、有界页缓存；
+   逐边 `union`，再经若干次定宽记录外排序把根重标为分量最小成员节点。
+   每个相同坐标类、每个真实分量都处理完整，不设分量上限。
+5. **phase 5 渲染**：按稳定序输出 `edges.tsv`/`nodes.tsv`，交叉核对每个
+   度数与邻接数。
+6. **phase 6 提交**：全部文件写完并 `fsync`，最后原子写
+   `topo_manifest.json` 作为唯一完成标志。
+
+外排序分块 `≈ cache_bytes/2`，并查页缓存 `≈ cache_bytes/8`；任何时刻驻留
+为一个几何 + 有限排序块 + 有限并查页，全体节点、边、邻接或分量都不会进入
+内存。`--max-spill-bytes` 是显式磁盘预算，超限即在 flush 处显式失败
+（`TopologySpillBudgetExceeded`），**绝不截断网络、绝不发布**。
+
+## 失败收敛与原目标保护
+
+* 先在目标旁构造 `topo.build-<pid>/` 暂存结果；只有全部写全并同步后，
+  清单才原子可见。异常退出、消费者中断（KeyboardInterrupt）或写满磁盘时，
+  暂存目录收敛为 `topo.failed/`（带证据与失败报告），**没有清单即不可被
+  消费者误认为已完成**。
+* `--force` 重建时，既有有效输出先原子挪到备份；任何失败都原样恢复它，
+  失败构建既不会在最终路径暴露半成品，也不会破坏上一个有效网络。
+
+## 校验合同（`topo validate`）
+
+打开即核对清单钉住的各文件长度；`validate_full` 重算全部 SHA-256 并证明：
+
+* 损坏字节、缺失/多余行、重复键、悬空节点/边引用；
+* 边端点坐标与其几何首末端**逐坐标一致**，存储长度与重算值**按位相等**；
+* 每个节点度数等于边端重算数，邻边引用列表与边表完全一致；
+* **分量声明正确**——由一个**独立实现**的朴素内存 BFS（不导入生产端的端头
+  归并、磁盘并查或任何遍历代码）重算连通闭包逐节点对照；
+* 可选重算源目录内容身份并把每条边对照源载荷（深几何一致性）；身份漂移即
+  `CorruptionError`，路径不可达时显式标注 `unreachable` 而非静默通过；
+* `selection.jsonl` 的排除/拒收计数与 `build_report.json`、清单计数一致。
+
+## 实测诊断（`build_report.json` / `topo diag`）
+
+所有数字来自真实执行：`records_scanned`、`records_excluded_filter`、
+`records_type_rejected`、`parts_parsed`、`zero_length_parts`、
+`endpoint_records`、`nodes`、`edges`、`components`、`spill_runs`、
+`spill_bytes_peak`、`tmp_bytes_written`、两 TSV 字节数与 SHA-256、
+`union_find_finds/unions/evictions`、`peak_rss_bytes`（进程峰值 RSS）。
+
+规模场景含**大量彼此分离的小组件**和**一个超大分量**（远超并查页缓存），
+用以检查有界资源处理与分量完整性；`topo diag` 还对每个节点、每条边运行
+独立朴素 oracle（`topo_oracle.py`，朴素坐标映射 + 显式栈图遍历，与生产代码
+零共享）差分。所有规模数据运行时生成，不提交大体量 fixture。

@@ -1,17 +1,22 @@
 """End-to-end CLI tests for the xtab subcommands."""
 
 import json
+import os
 import subprocess
 import sys
 
 from spatial_catalog.xreader import XTable
 from helpers import write_records
 
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_ENV = dict(os.environ, PYTHONPATH=_REPO_ROOT + os.pathsep +
+            os.environ.get("PYTHONPATH", ""))
+
 
 def _run(*args):
     proc = subprocess.run(
         [sys.executable, "-m", "spatial_catalog", *args],
-        capture_output=True, text=True)
+        capture_output=True, text=True, cwd=_REPO_ROOT, env=_ENV)
     return proc
 
 

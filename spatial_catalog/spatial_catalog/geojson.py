@@ -191,8 +191,28 @@ def validate_record(obj, line_no, max_payload_bytes=DEFAULT_MAX_PAYLOAD_BYTES,
         raise Reject(R_EMPTY, "geometry is empty", line_no=line_no,
                      object_id=object_id)
     if not geom.is_valid:
-        raise Reject(R_INVALID, "geometry is invalid (e.g. self-intersecting)",
-                     line_no=line_no, object_id=object_id)
+        # A repeated-position (zero-length) LineString part is reported as
+        # invalid by GEOS, but it is not malformed input: the topology
+        # contract explicitly treats a zero-length line part as a legal
+        # self loop (both ends reference the same node).  Accept line
+        # geometries whose only invalidity is zero-length part(s); reject
+        # every other invalidity without repairing it.
+        gtype = geom.geom_type
+        acceptable_line = False
+        if gtype == "LineString":
+            acceptable_line = (
+                len(geom.coords) >= 2
+                and all(geom.coords[0] == p for p in geom.coords))
+        elif gtype == "MultiLineString":
+            acceptable_line = all(
+                len(g.coords) >= 2
+                and all(g.coords[0] == p for p in g.coords)
+                for g in geom.geoms if g.length == 0.0) and all(
+                    g.is_valid for g in geom.geoms if g.length > 0.0)
+        if not acceptable_line:
+            raise Reject(R_INVALID,
+                         "geometry is invalid (e.g. self-intersecting)",
+                         line_no=line_no, object_id=object_id)
     wkb = geom.wkb
     if len(wkb) > max_payload_bytes:
         raise Reject(R_PAYLOAD_TOO_LARGE,

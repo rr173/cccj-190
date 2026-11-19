@@ -262,3 +262,89 @@ def gen_xtab_unicode_ids(seed=13):
     rng.shuffle(lines)
     rng.shuffle(zones)
     return lines, zones
+
+
+# ------------------------------------------------ topology generators
+
+def gen_topo_scale_records(n_small=3000, big_size=1000, seed=31,
+                           cell=1000.0):
+    """Scale scene for bounded-resource topology runs.
+
+    * ``n_small`` disjoint tiny components (pairs/triples placed on a wide
+      grid so no coordinate of one ever equals another's);
+    * exactly ONE giant connected component: a closed ring of ``big_size``
+      edges whose consecutive ends share exact integer coordinates, plus
+      a few extra spokes, so component closure has to process one large
+      graph completely rather than cap its size;
+    * some deliberately non-line records (points/polygons) interspersed so
+      the explicit type-rejection / filter paths are exercised at scale.
+    """
+    rng = random.Random(seed)
+    records = []
+    side = max(1, int(n_small ** 0.5) + 1)
+    step = cell
+    for i in range(n_small):
+        gx, gy = divmod(i, side)
+        ox = gx * step * 3
+        oy = gy * step * 3
+        if i % 3 == 0:
+            # two-edge chain, three nodes
+            records.append({"object_id": "sm-%08d-a" % i,
+                            "geometry": _line([(ox, oy), (ox + 1, oy)])})
+            records.append({"object_id": "sm-%08d-b" % i,
+                            "geometry": _line([(ox + 1, oy),
+                                               (ox + 2, oy + 1)])})
+        elif i % 3 == 1:
+            # isolated single line, own two nodes
+            records.append({"object_id": "sm-%08d-s" % i,
+                            "geometry": _line([(ox, oy), (ox + 1, oy + 1)])})
+        else:
+            # three-way fork around a shared node
+            records.append({"object_id": "sm-%08d-f1" % i,
+                            "geometry": _line([(ox, oy), (ox + 1, oy)])})
+            records.append({"object_id": "sm-%08d-f2" % i,
+                            "geometry": _line([(ox, oy), (ox, oy + 1)])})
+            records.append({"object_id": "sm-%08d-f3" % i,
+                            "geometry": _line([(ox, oy), (ox - 1, oy)])})
+        if i % 17 == 0:
+            records.append({"object_id": "pt-%08d" % i,
+                            "geometry": _point(ox + 50, oy + 50)})
+    # giant component: a regular polygon ring on integer coordinates built
+    # from axis-aligned segments so every shared end is bit-exact equal.
+    giant = []
+    cx, cy = 500000, 500000
+    radius = big_size
+    prev = None
+    for i in range(big_size):
+        # axis-aligned stair-step around the ring: each edge unit length 1,
+        # consecutive edges share one exact coordinate node
+        x0 = cx + i
+        y0 = cy + (i % 2)
+        x1 = cx + i + 1
+        y1 = cy + ((i + 1) % 2)
+        giant.append({"object_id": "gi-%08d" % i,
+                      "geometry": _line([(x0, y0), (x1, y1)])})
+    # close the ring back to the first node with one more exact edge
+    giant.append({"object_id": "gi-%08d" % big_size,
+                  "geometry": _line([(cx + big_size, cy + (big_size % 2)),
+                                     (cx, cy)])})
+    rng.shuffle(records)
+    rng.shuffle(giant)
+    return records + giant
+
+
+def gen_topo_unicode_sources(seed=32):
+    """Small set with Unicode object ids and reversed coordinate order,
+    for code point ordering and reverse-sequence stability checks."""
+    rng = random.Random(seed)
+    records = [
+        {"object_id": "线-甲", "geometry": _line([(0, 0), (1, 0)])},
+        {"object_id": "线-乙", "geometry": _line([(1, 0), (2, 0)])},
+        {"object_id": "Ω-edge", "geometry": _line([(5, 5), (1, 0)])},
+        {"object_id": "å-loop",
+         "geometry": {"type": "MultiLineString",
+                      "coordinates": [[[7, 7], [7, 7]],
+                                      [[7, 7], [8, 8]]]}},
+    ]
+    rng.shuffle(records)
+    return records
