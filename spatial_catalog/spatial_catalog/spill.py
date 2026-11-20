@@ -289,3 +289,196 @@ class SpillablePQ:
     def __exit__(self, *exc):
         self.close()
         return False
+
+
+# ------------------------------------------------------- spillable heap
+
+class _HeapRunReader:
+    """Streaming reader over one sorted spill run of length-prefixed byte
+    records; the ordering key is recomputed from each record via key_fn."""
+
+    __slots__ = ("path", "fh", "key_fn", "exhausted", "key", "data")
+
+    def __init__(self, path, key_fn):
+        self.path = path
+        self.fh = open(path, "rb")
+        self.key_fn = key_fn
+        self.exhausted = False
+        self.key = None
+        self.data = None
+        self._advance()
+
+    def _advance(self):
+        head = self.fh.read(_LEN.size)
+        if len(head) < _LEN.size:
+            self.exhausted = True
+            self.key = None
+            self.data = None
+            return
+        (n,) = _LEN.unpack(head)
+        data = self.fh.read(n)
+        if len(data) != n:
+            raise IOError("heap spill run %s truncated" % self.path)
+        self.data = data
+        self.key = self.key_fn(data)
+
+    def take(self):
+        item = self.data
+        self._advance()
+        return item
+
+    def close(self):
+        try:
+            self.fh.close()
+        finally:
+            _quiet_unlink(self.path)
+
+
+class SpillableHeap:
+    """Min-heap over byte records ordered by ``key_fn(record)``.
+
+    Up to ``max_items`` records stay in an in-memory heap; beyond that the
+    heap is flushed to a sorted run file on disk and pops merge the memory
+    heap with the run heads.  Keys are arbitrary comparable tuples (they are
+    never serialised: each run reader recomputes them from the record), so
+    this structure serves sweeps whose ordering is not a single float.
+    Memory stays bounded regardless of how many records a worst-case input
+    pushes.
+    """
+
+    _INSTANCE_SEQ = [0]   # class-level counter: unique run-file prefix
+
+    def __init__(self, key_fn, max_items=65536, spill_dir=None, tag="heap",
+                 max_runs=32):
+        self._key_fn = key_fn
+        SpillableHeap._INSTANCE_SEQ[0] += 1
+        # unique per-instance prefix so heaps sharing one spill_dir never
+        # overwrite each other's run files
+        self._tag = "%s-%d" % (tag, SpillableHeap._INSTANCE_SEQ[0])
+        self.max_items = max(16, int(max_items))
+        self._heap = []            # (key, seq, record)
+        self._runs = []            # list[_HeapRunReader]
+        self._heads = []           # heap of (key, run_index)
+        self._seq = 0
+        self._max_runs = max_runs
+        self._own_dir = spill_dir is None
+        self._tmpdir = spill_dir or tempfile.mkdtemp(prefix="spcheap-")
+        os.makedirs(self._tmpdir, exist_ok=True)
+        self.spills = 0
+        self.high_water = 0        # max live records (memory + spilled)
+        self.total_pushed = 0
+        self._run_items = 0        # live records currently in spill runs
+        self._closed = False
+
+    def _spill(self):
+        items = sorted(self._heap)
+        self._heap = []
+        path = os.path.join(self._tmpdir,
+                            "%s-run-%06d.tmp" % (self._tag, self.spills))
+        with open(path, "wb") as fh:
+            for _key, _seq, rec in items:
+                fh.write(_LEN.pack(len(rec)))
+                fh.write(rec)
+        self._runs.append(_HeapRunReader(path, self._key_fn))
+        self._run_items += len(items)
+        self._heads = [(r.key, i) for i, r in enumerate(self._runs)
+                       if not r.exhausted]
+        heapq.heapify(self._heads)
+        self.spills += 1
+        if len(self._runs) > self._max_runs:
+            self._merge_runs()
+
+    def _merge_runs(self):
+        path = os.path.join(self._tmpdir,
+                            "%s-merge-%06d.tmp" % (self._tag, self.spills))
+        self.spills += 1
+        sources = self._runs
+        heap = [(r.key, i, r) for i, r in enumerate(sources) if not r.exhausted]
+        heapq.heapify(heap)
+        with open(path, "wb") as fh:
+            while heap:
+                _, i, r = heapq.heappop(heap)
+                rec = r.take()
+                fh.write(_LEN.pack(len(rec)))
+                fh.write(rec)
+                if not r.exhausted:
+                    heapq.heappush(heap, (r.key, i, r))
+        for r in sources:
+            r.close()
+        self._runs = [_HeapRunReader(path, self._key_fn)]
+        self._heads = [(self._runs[0].key, 0)] \
+            if not self._runs[0].exhausted else []
+
+    def push(self, rec):
+        if self._closed:
+            raise ValueError("push on closed SpillableHeap")
+        heapq.heappush(self._heap, (self._key_fn(rec), self._seq, rec))
+        self._seq += 1
+        self.total_pushed += 1
+        live = len(self._heap) + self._run_items
+        if live > self.high_water:
+            self.high_water = live
+        if len(self._heap) > self.max_items:
+            self._spill()
+
+    def empty(self):
+        return not self._heap and not self._heads
+
+    def __len__(self):
+        return len(self._heap) + self._run_items
+
+    def peek(self):
+        """Return the smallest record without removing it (None if empty)."""
+        if self.empty():
+            return None
+        take_heap = True
+        if self._heads:
+            if not self._heap:
+                take_heap = False
+            elif self._heads[0][0] < self._heap[0][0]:
+                take_heap = False
+        if take_heap:
+            return self._heap[0][2]
+        return self._runs[self._heads[0][1]].data
+
+    def pop(self):
+        """Removes and returns the smallest record."""
+        if self.empty():
+            raise IndexError("pop from empty SpillableHeap")
+        take_heap = True
+        if self._heads:
+            if not self._heap:
+                take_heap = False
+            elif self._heads[0][0] < self._heap[0][0]:
+                take_heap = False
+        if take_heap:
+            _key, _seq, rec = heapq.heappop(self._heap)
+            return rec
+        _key, idx = heapq.heappop(self._heads)
+        reader = self._runs[idx]
+        rec = reader.take()
+        self._run_items -= 1
+        if not reader.exhausted:
+            heapq.heappush(self._heads, (reader.key, idx))
+        else:
+            reader.close()
+        return rec
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        for r in self._runs:
+            r.close()
+        self._runs = []
+        self._heads = []
+        self._heap = []
+        if self._own_dir:
+            shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False

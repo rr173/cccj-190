@@ -63,6 +63,20 @@ python3 -m spatial_catalog topo info     --topology topo
 python3 -m spatial_catalog topo diag     --out /tmp/topo-diag \
     --n 6000 --big 1500      # diagnose 是 diag 的别名
 
+# ===== 巡检覆盖对账（inspcov）=====
+# 给定拓扑边名册、桩号登记表与若干无序巡检 JSONL，重现两个收件截止号
+# 上的覆盖台账并逐区段对账。原拓扑只读打开，绝不被修改。
+python3 -m spatial_catalog inspcov build \
+    --topology topo --registry registry.jsonl \
+    --inspections crew-a.jsonl crew-b.jsonl \
+    --date-from 2026-11-01 --date-to 2026-12-01 \
+    --cutoff-before 12 --cutoff-after 18 --out inspcov \
+    --cache-bytes 8388608 --max-spill-bytes 1073741824 --force
+python3 -m spatial_catalog inspcov validate --coverage inspcov
+python3 -m spatial_catalog inspcov info     --coverage inspcov
+python3 -m spatial_catalog inspcov diag     --out /tmp/insp-diag \
+    --n-edges 400 --trunk-obs 4000
+
 # 测试
 python3 -m pytest
 ```
@@ -305,7 +319,6 @@ SHA-256、`peak_rss_bytes`、`duration_s`。
 但都无法回答“哪些设施端头相接、网络分成几块、每块包含哪些原始线部件”。
 `topo` 把目录里的线设施固化成一份**可直接检查连接关系的节点—边网络**，
 而不是又一种查询或报表。
-
 ## 连接语义（合同的核心）
 
 * 只有 `LineString`/`MultiLineString` 转成边。`MultiLineString` 按**部件
@@ -437,3 +450,171 @@ edge_key ⇥ source_id ⇥ part_index ⇥ from_node ⇥ to_node ⇥ geometry
 用以检查有界资源处理与分量完整性；`topo diag` 还对每个节点、每条边运行
 独立朴素 oracle（`topo_oracle.py`，朴素坐标映射 + 显式栈图遍历，与生产代码
 零共享）差分。所有规模数据运行时生成，不提交大体量 fixture。
+
+
+---
+
+# 巡检覆盖对账（inspcov）
+
+巡检班组按路段桩号登记结果，方向可能与底图相反；月报发布后又常收到补录、
+更正和撤回。`topo` 的边表回答了“网络里有哪些路段”，却无法回答“上次月报
+关账时我们知道什么、这次重算后哪些区段补齐了/重新缺检了/只是换了证据”。
+`inspcov` 把同一报告期、两个收件截止号上的巡检记录固化成**两份覆盖台账和
+一份逐区段差异**，供维护员据此安排复查。拓扑只充当路段名册：不重算节点、
+连通分量或几何相交，也不把一条路段的巡检传到相邻路段。
+
+## 输入契约
+
+* **拓扑产物**（`topo build` 的目录）：只读打开，用其 `edges.tsv` 验证登记表
+  引用的边确实存在、且不是零长度几何边，并钉住其内容身份（见下）。
+* **桩号登记表**（JSONL）：每行
+  `{"source_id": ..., "part_index": ..., "chainage_end": L}`。`L` 为正整数
+  桩号终点（≤ 有符号 64 位上限）。纳管范围就是登记表列出的边，不要求覆盖
+  整个网络。**重复登记、引用不存在的边、引用零长度几何边一律整体失败**。
+  桩号是维护台账的整数计量单位，**不从浮点几何长度换算**。
+* **巡检文件**（一个或多个无序 UTF-8 JSONL）：每行一个修订，以
+  `inspection_id` 标识一条观察，带正整数 `batch`，`action` 为 `upsert`（整条
+  观察）或 `retract`（撤回，不带观察内容；撤回一个从未见过的编号是合法的
+  无效化声明）。`upsert` 字段：`source_id`、`part_index`、`direction`
+  （`forward`/`reverse`）、整数区间 `[lo, hi)`（`0 <= lo < hi <= L`）、覆盖
+  日期区间 `[start, end)`、巡检日期 `checked_on`、非负整数 `priority`、结果
+  `pass`/`defect`。日期为严格公历 `YYYY-MM-DD`，区间不得为空；所有输入整数
+  不得超过有符号 64 位上限。
+  * 同一 `(inspection_id, batch)` 字段值完全相同是**重复送达**，只算一次；
+    字段值不同是**冲突**，构建失败并在证据中给出原始文件与行号。
+  * 方向沿拓扑边坐标序列时直接使用桩号；逆向时把区间映射为
+    `[L-hi, L-lo)`。
+  * 覆盖日期与收件批次是两根不同的时间轴：**不用日期推断收件先后**。
+
+## 两次关账的重现语义
+
+给定非空报告窗口 `[from, to)` 与两个 `0 <= before <= after` 的收件截止号。
+在每个截止号：
+
+1. 在全部收件中为每个编号选出**不晚于截止号的最大批次**修订；
+2. 去掉撤回（撤回即无效化该编号在该截止号的观察）；
+3. 裁剪到报告期（与 `[from, to)` 求交，空则该观察不贡献）。
+
+更正可搬到别的边、日期或桩号：**不能只用更正覆盖原区间的重叠部分**（旧版本
+整体被取代），也**不能因为最新版本落在报告期外就把旧版本捡回来**。
+
+对纳管边的每个日期与桩号位置，重叠观察只取一条：**优先级高者先，其次巡检
+日期较晚者先，仍相同则取 `inspection_id` Unicode 码点序较小者**。没有胜出
+记录就是 `gap`（包括一条观察都没有的纳管边）。输出附胜出的
+`(inspection_id, batch)`，因此可回查是哪次更正或补录提供了结果——**收件较新
+不意味着优先级更高**。
+
+## 输出目录（版本化、原子提交）
+
+```
+inspcov/
+  inspcov_manifest.json  # 提交点：格式版本、拓扑身份、登记表与各巡检
+                         #   文件摘要、两个截止号、报告窗口、各输出文件
+                         #   长度 + SHA-256（最后原子写入）
+  managed.tsv            # 纳管边名册（source_id, part_index, chainage_end）
+  coverage_before.tsv    # before 截止号覆盖台账（矩形行）
+  coverage_after.tsv     # after 截止号覆盖台账
+  diff.tsv               # 逐区段差异（前后两侧状态与证据）
+  summary.json           # 机器可读小结（状态对 + 仅证据替换，桩号单位×天数）
+  build_report.json      # 全部为实测计数的构建诊断
+```
+
+覆盖台账**完整铺满**各纳管边 `[from, to) × [0, L)`，每行是一个带日期起止与
+桩号起止的矩形，携带状态与证据键（`gap` 无证据）。归并规则：
+
+* 同一天相邻、状态和证据完全相同的桩号段合为一段；
+* 相邻日期的**整条边剖面**相同时合并为一个日期段。
+
+差异表按同样的归并方式输出两个截止号**状态或证据不同**的位置，每行携带前后
+两侧。差异的日期剖面是该日差异段的完整有序集合；**空剖面不输出，且不允许
+跨过空剖面合并**。不直接比较两份表的行键推断变化，也不把只换证据的区段报成
+状态变化。小结按状态对（如 `defect>pass`）与仅证据替换（如 `pass>pass`）
+分别累计变化的“桩号单位 × 天数”，**一处变化只计一次**。
+
+排序：同一边按日期起点、再按正向桩号起点；边按 `(source_id, part_index)`
+排序，字符串用 Unicode 码点序（UTF-8 字节序与之一致，与 locale 无关）。
+
+## 内存/磁盘边界
+
+这是可能超过内存的全网数据处理：一条干线自身的修订、重叠观察和最终剖面也
+可能很大。构建**不把**完整修订历史、单边全部活动记录、单个巨大剖面或结果表
+常驻内存，也**不逐天逐桩号展开**、不物化所有日期端点与所有桩号端点的笛卡尔
+格。覆盖计算、跨截止号差异对齐和输出归并都在显式预算下工作，否则明确失败：
+
+| 预算 | 作用域 |
+|---|---|
+| `--cache-bytes` | 外排序分块（≈一半/块）、扫描堆与剖面存储的内存上限 |
+| `--max-spill-bytes` | 显式磁盘暂存上限，超限即在 flush 处显式失败，绝不发布部分月报 |
+
+* 修订、可见观察、日期端点、登记表都走**外排序**（分块排序 + 多路归并）；
+* 每条边的日期×桩号扫描用**可溢写堆**（`SpillableHeap`）保存活动观察与胜者
+  候选，超出内存上限即落盘为有序运行文件并归并；
+* 剖面归并用**可溢写剖面存储**，逐区间与上一区间比对，相同则并入日期段；
+* 结果行流式写出，任何时刻驻留 = 有限排序块 + 有限堆 + 有限剖面。
+
+## 实测统计（`build_report.json` / `inspcov diag`）
+
+全部为真实执行计数：`topology_edges_scanned`、`registry_lines`、
+`managed_edges`、`revision_files`、`revision_lines`、`revisions_upsert`、
+`revisions_retract`、`duplicate_deliveries`、`visible_observations`、
+`observations_clipped_empty`、`elementary_date_intervals`、
+`observation_activations`（扫描处理的观察边界实例）、`cov_before_segments`/
+`cov_after_segments`/`diff_segments`（归并前最细段）、`date_runs_*`、
+`coverage_rows_*`、`diff_rows`（实际交付行）、`spill_runs`、`heap_spills`、
+`heap_high_water`、`spill_bytes_peak`、`tmp_bytes_written`、`peak_rss_bytes`。
+**隐藏在高优先级观察下的边界**（被遮蔽、未成为交付行的边界）由
+`observation_activations`、最细段数与交付行数之差体现，与实际交付行区分。
+
+## 失败收敛与原目标保护
+
+* 先在目标旁构造 `inspcov.build-<pid>/`；只有全部写全并 fsync 后，清单才原子
+  可见。坏行、未知引用、损坏的被消费拓扑边表、修订冲突、暂存写失败都会使
+  构建失败并收敛为 `inspcov.failed/`（带证据与失败报告），**绝不发布看似成功
+  的部分月报**。
+* `--force` 重建时，既有有效输出先原子挪到备份；任何失败都原样恢复它——
+  失败既不会暴露半成品，也不会破坏上一份有效对账。
+* 临时数据全部在 `*.build-<pid>/tmp` 内，正常完成与失败路径都会清理，不入 Git。
+
+## 校验合同（`inspcov validate`）
+
+打开即核对清单钉住的各文件长度；`validate_full` 重算全部 SHA-256 并证明
+（**不要求重跑拓扑构建**）：
+
+* 每行头部、字段数、规范编码、日期/区间/状态词表合法；
+* 行严格按 `(source_id, part_index)` 码点序、再按日期起点、桩号起点排列；
+* 每份覆盖台账对每个纳管边**无缺无重**铺满 `[from, to) × [0, L)`（窗口取自
+  清单，`L` 取自 `managed.tsv`）；
+* 差异与两份台账一致：用一个**独立实现**的对齐器从 `coverage_before` 与
+  `coverage_after` 重新逐格推出差异矩形，要求与 `diff.tsv` 逐行相等；
+* `summary.json` 的状态对与仅证据替换合计等于从 `diff.tsv` 重算的合计；
+* 清单中的批次参数（两个截止号、报告窗口）与交付内容一致；
+* 可选地把 `managed.tsv` 对照登记表、把拓扑内容身份对照清单钉住值；路径不可
+  达时显式标注 `unreachable` 而非静默通过。
+
+## 为什么覆盖与差异的表示不受修订或遍历次序影响
+
+* **修订选择是集合函数**：每个编号在两个截止号上的胜出修订只取决于
+  `(inspection_id, batch)` 集合（不晚于截止号的最大批次），与这些修订写在
+  哪些文件、以什么顺序读到无关。重复送达按内容去重，冲突按内容报错，因此
+  同一批次的记录如何分放、如何到达都收敛到同一个“可见修订集”。
+* **覆盖是逐格全序**：每个 `(日期, 桩号)` 格的胜者由全序键
+  `(优先级, 巡检日期, inspection_id)` 唯一决定，与计算顺序无关；`gap` 是
+  “没有胜者”的确定结果。
+* **归并是规范形式**：桩号方向取“相邻等值即并”的极大段，日期方向取“整边
+  剖面相同即并”的极大段，都是格值函数的唯一规范分解，与扫描到边界的先后
+  无关。被高优先级观察遮蔽的边界本就不改变格值，自然被归并吸收。
+* **差异是格值差**：差异先逐格比较两份覆盖，再做同样的规范归并；因此差异
+  与小结是两个截止号各自“可见修订集”的纯函数。
+* **预算只改变数据落点**：外排序分块大小、堆与剖面是否溢写，只影响数据在
+  内存还是磁盘，不改变排序后的记录流、扫描结果或归并结果——不同
+  `--cache-bytes` 下业务输出逐字节相同（测试与诊断都验证了这一点）。
+
+## 正确性 oracle
+
+`spatial_catalog/ioracle.py` 是独立的逐格参考实现：把小整数桩号、短日期窗口
+的每个 `(日期, 桩号)` 格展开，用最朴素的全扫描选胜者，再独立归并出台账、
+差异与小结，与生产代码**零共享**。`tests/test_insp_differential.py` 对随机小
+场景逐点比较前后状态、证据与变化合计，并单独核对矩形归并的规范性；
+`tests/test_insp_scale.py` 在含一条长尾干线、大批被遮蔽交错观察与大量分散
+路段的运行时生成场景上，比较不同预算下的业务输出并验证被迫落盘与资源用尽
+行为。所有规模数据运行时生成，不提交大体量 fixture。

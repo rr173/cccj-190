@@ -8,9 +8,12 @@ from .builder import build          # noqa: F401
 from .catalog import Catalog        # noqa: F401
 from .errors import (BuildError, CatalogError, CorruptionError,   # noqa: F401
                      CrossTableError, IllegalReferenceError,
+                     InspectionError, InspectionSpillBudgetExceeded,
                      NotACatalogError, QueryError,
                      SpillBudgetExceeded, UnsupportedVersionError)
 from .xtab import build_crosstab    # noqa: F401
 from .xreader import XTable         # noqa: F401
 from .topo import Selection, build_topology  # noqa: F401
 from .treader import Topology       # noqa: F401
+from .insp import build_coverage    # noqa: F401
+from .ireader import Coverage       # noqa: F401

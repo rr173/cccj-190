@@ -95,3 +95,44 @@ python3 -m pytest tests/test_xtab_scale.py -s
 - 计数器不变量由构建器自检：`positive + zero == exact`、
   `rows + dedup_dropped == positive`，违反即失败不发布。
 
+
+---
+
+# 巡检覆盖对账诊断（inspcov）
+
+复现命令（数据全部运行时生成，固定种子，不提交大型生成物）：
+
+```bash
+python3 -m spatial_catalog inspcov diag --out /tmp/insp-diag \
+    --n-edges 400 --trunk-obs 4000 --cache-bytes 1048576 --seed 47
+```
+
+## `inspcov diag` 实测（400 分散路段 + 1 条长尾干线（4000 条交错观察）；cache 1 MiB；种子 47）
+
+场景：401 条纳管边、6461 行修订（批次 1..6，含更正与撤回），报告窗口
+14 天，截止号 3 与 6。
+
+| 指标 | 结果 |
+|---|---|
+| 输入修订行 | 6,461 |
+| 可见观察（before/after 去重后记录） | 5,689（before 3,878 / after 4,957） |
+| 基本日期区间（处理的日期边界） | 2,270 |
+| 观察激活（扫描处理的观察边界实例） | 21,653 |
+| 归并前最细段（before/after/diff） | 5,549 / 6,970 / 1,466 |
+| 交付行（before/after/diff） | 4,330 / 6,569 / 1,278 |
+| 日期段（before/after/diff） | 1,645 / 2,122 / 793 |
+| 外排溢写运行文件 / 扫描堆溢写 | 6 / 26 |
+| 扫描堆峰值驻留 | 1,903 条 |
+| 暂存峰值 / 临时写出 | 2.66 MiB / 2.34 MiB |
+| 峰值 RSS | 43.8 MiB |
+| 构建耗时 | ~1.0 s |
+
+* **隐藏边界 vs 交付行**：21,653 次观察激活、5,549/6,970 个最细段，最终只
+  交付 4,330/6,569 行——被高优先级观察遮蔽的边界（未成为交付行）由
+  激活数、最细段数与交付行数之差如实体现。
+* **预算无关性**：同一场景在 1 MiB 与 8 MiB 预算下各构建一次，五份业务
+  输出（managed、coverage_before、coverage_after、diff、summary）的
+  SHA-256 逐字节一致（`budget_independence.identical = true`）。
+* **独立校验**：`inspcov validate` 的独立对齐器从两份台账重推差异并与
+  `diff.tsv` 逐行相等；`ioracle.py` 逐格 oracle 对一个小型子场景逐点
+  断言一致（`oracle_diff.ok = true`）。

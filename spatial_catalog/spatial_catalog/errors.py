@@ -81,3 +81,23 @@ class TopologyError(CatalogError):
 class TopologySpillBudgetExceeded(TopologyError):
     """The topology build's explicit on-disk spill budget was exhausted;
     no partial network is published."""
+
+
+class InspectionError(CatalogError):
+    """Inspection-coverage reconciliation build, validation or open failure.
+
+    Carries an optional structured evidence path (reject/conflict files
+    written next to the failed build directory) so every bad record is
+    locatable by source file and line number.
+    """
+
+    def __init__(self, message, evidence_path=None, reason=None, detail=None):
+        super().__init__(message)
+        self.evidence_path = evidence_path
+        self.reason = reason
+        self.detail = detail
+
+
+class InspectionSpillBudgetExceeded(InspectionError):
+    """The reconciliation's explicit on-disk spill budget was exhausted;
+    no partial monthly report is published."""

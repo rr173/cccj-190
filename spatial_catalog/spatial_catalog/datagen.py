@@ -348,3 +348,151 @@ def gen_topo_unicode_sources(seed=32):
     ]
     rng.shuffle(records)
     return records
+
+
+# -------------------------------------------- inspection reconciliation
+
+def _iso(ordinal):
+    import datetime
+    return datetime.date.fromordinal(ordinal).isoformat()
+
+
+def _ord(y, m, d):
+    import datetime
+    return datetime.date(y, m, d).toordinal()
+
+
+def gen_insp_scale(n_edges=400, trunk_obs=4000, seed=47, window_days=14,
+                   trunk_length=2000, n_batches=6):
+    """Scale scene for bounded-resource inspection reconciliation.
+
+    Returns (catalog_records, registry_entries, revisions, window,
+    cutoffs) with:
+
+    * one long-tail trunk edge (``trunk_length`` chainage units) carrying
+      ``trunk_obs`` heavily interleaved, mostly shadowed observations with
+      staggered dates (many elementary date intervals) and overlapping
+      chainage spans (large active sets);
+    * ``n_edges`` scattered small edges with a handful of observations
+      each, so the run also processes a wide roster;
+    * revisions spread over ``n_batches`` batches with corrections and
+      retracts, so the two cutoffs reconcile to a non-trivial diff.
+    """
+    rng = random.Random(seed)
+    from_ord = _ord(2026, 11, 1)
+    to_ord = from_ord + window_days
+    window = (_iso(from_ord), _iso(to_ord))
+    records = []
+    registry = []
+    # trunk edge
+    records.append({"object_id": "trunk",
+                    "geometry": _line([(0, 0), (trunk_length, 0)])})
+    registry.append({"source_id": "trunk", "part_index": 0,
+                     "chainage_end": trunk_length})
+    # scattered edges
+    edges = [("trunk", 0, trunk_length)]
+    for i in range(n_edges):
+        sid = "sc-%04d" % i
+        L = rng.randint(5, 120)
+        records.append({"object_id": sid,
+                        "geometry": _line([((i + 1) * 1000, 0),
+                                           ((i + 1) * 1000 + L, 0)])})
+        registry.append({"source_id": sid, "part_index": 0,
+                         "chainage_end": L})
+        edges.append((sid, 0, L))
+
+    revisions = []
+
+    def add_obs(iid, batch, sid, part, L):
+        lo = rng.randint(0, L - 1)
+        hi = rng.randint(lo + 1, L)
+        d0 = rng.randint(0, window_days - 1)
+        d1 = rng.randint(d0 + 1, window_days)
+        revisions.append({
+            "inspection_id": iid, "batch": batch, "action": "upsert",
+            "source_id": sid, "part_index": part,
+            "direction": "forward" if rng.random() < 0.5 else "reverse",
+            "lo": lo, "hi": hi,
+            "start": _iso(from_ord + d0), "end": _iso(from_ord + d1),
+            "checked_on": _iso(from_ord + rng.randint(0, window_days)),
+            "priority": rng.randint(0, 6),
+            "result": "pass" if rng.random() < 0.7 else "defect"})
+
+    # trunk: many interleaved, mostly shadowed observations
+    for k in range(trunk_obs):
+        add_obs("tr-%06d" % k, rng.randint(1, n_batches - 2), "trunk", 0,
+                trunk_length)
+    # trunk corrections + retracts in the later batches (drive the diff);
+    # corrections and retracts use disjoint batch ranges so no (id, batch)
+    # ever conflicts
+    for k in range(0, trunk_obs, 7):
+        add_obs("tr-%06d" % k, n_batches - 1, "trunk", 0, trunk_length)
+    for k in range(0, trunk_obs, 11):
+        revisions.append({"inspection_id": "tr-%06d" % k,
+                          "batch": n_batches, "action": "retract"})
+    # scattered observations
+    for i, (sid, part, L) in enumerate(edges):
+        n = rng.randint(1, 6)
+        for j in range(n):
+            add_obs("sc-%04d-%02d" % (i, j), rng.randint(1, n_batches - 1),
+                    sid, part, L)
+        if rng.random() < 0.3:
+            revisions.append({"inspection_id": "sc-%04d-%02d" % (i, 0),
+                              "batch": n_batches, "action": "retract"})
+    rng.shuffle(revisions)
+    cutoffs = {"before": n_batches // 2, "after": n_batches}
+    return records, registry, revisions, window, cutoffs
+
+
+def gen_insp_random(rng, n_edges=4, max_L=12, window_days=5, n_ids=6,
+                    max_batch=6, base_ordinal=None):
+    """Small random scene for per-cell differential tests (small integer
+    chainages and a short date window keep the oracle grid tiny).
+
+    Returns (edges, catalog_records, revisions, window, from_ord, to_ord)
+    where edges maps (source_id, part_index) -> chainage_end."""
+    if base_ordinal is None:
+        base_ordinal = _ord(2026, 11, 1)
+    from_ord = base_ordinal
+    to_ord = from_ord + window_days
+    window = (_iso(from_ord), _iso(to_ord))
+    edges = {}
+    records = []
+    for i in range(n_edges):
+        sid = "e%02d" % i
+        L = rng.randint(1, max_L)
+        edges[(sid, 0)] = L
+        records.append({"object_id": sid,
+                        "geometry": _line([(i * 1000, 0),
+                                           (i * 1000 + L, 0)])})
+    revisions = []
+    ids = ["i%d" % k for k in range(n_ids)] + ["i-甲", "i-乙"]
+    for iid in ids:
+        nb = rng.randint(0, 3)
+        batches = random.sample(range(1, max_batch + 1),
+                                min(nb, max_batch))
+        for b in sorted(batches):
+            if rng.random() < 0.2:
+                revisions.append({"inspection_id": iid, "batch": b,
+                                  "action": "retract"})
+            else:
+                sid, part = random.choice(list(edges.keys()))
+                L = edges[(sid, part)]
+                lo = rng.randint(0, L - 1)
+                hi = rng.randint(lo + 1, L)
+                d0 = rng.randint(0, window_days - 1)
+                d1 = rng.randint(d0 + 1, window_days)
+                revisions.append({
+                    "inspection_id": iid, "batch": b, "action": "upsert",
+                    "source_id": sid, "part_index": part,
+                    "direction": "forward" if rng.random() < 0.5
+                    else "reverse",
+                    "lo": lo, "hi": hi,
+                    "start": _iso(from_ord + d0 - rng.randint(0, 1)),
+                    "end": _iso(from_ord + d1 + rng.randint(0, 1)),
+                    "checked_on": _iso(from_ord + rng.randint(
+                        0, window_days)),
+                    "priority": rng.randint(0, 3),
+                    "result": "pass" if rng.random() < 0.6 else "defect"})
+    rng.shuffle(revisions)
+    return edges, records, revisions, window, from_ord, to_ord

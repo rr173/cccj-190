@@ -25,7 +25,7 @@ from . import format as fmt
 from .builder import build
 from .catalog import Catalog
 from .errors import (BuildError, CatalogError, CrossTableError,
-                     TopologyError)
+                     InspectionError, TopologyError)
 
 
 def _print(obj):
@@ -168,6 +168,48 @@ def cmd_topo_info(args):
 def cmd_topo_diag(args):
     from .tdiag import run_topo_diag
     _print(run_topo_diag(args.out, n=args.n, big=args.big,
+                         cache_bytes=args.cache_bytes,
+                         max_spill_bytes=args.max_spill_bytes,
+                         seed=args.seed))
+    return 0
+
+
+# --------------------------------------------- inspection reconciliation CLI
+
+def cmd_inspcov_build(args):
+    from .insp import build_coverage
+    report = build_coverage(
+        args.topology, args.registry, args.inspections, args.out,
+        date_from=args.date_from, date_to=args.date_to,
+        cutoff_before=args.cutoff_before, cutoff_after=args.cutoff_after,
+        cache_bytes=args.cache_bytes, max_spill_bytes=args.max_spill_bytes,
+        force=args.force,
+        log=lambda *a: print(*a, file=sys.stderr))
+    _print(report)
+    return 0
+
+
+def cmd_inspcov_validate(args):
+    from .ireader import Coverage
+    with Coverage(args.coverage) as cov:
+        result = cov.validate_full(
+            registry=False if args.no_registry else (args.registry or None),
+            topology=False if args.no_topology else (args.topology or None))
+    _print(result)
+    return 0
+
+
+def cmd_inspcov_info(args):
+    from .ireader import Coverage
+    with Coverage(args.coverage) as cov:
+        _print(cov.manifest)
+    return 0
+
+
+def cmd_inspcov_diag(args):
+    from .idiag import run_insp_diag
+    _print(run_insp_diag(args.out, n_edges=args.n_edges,
+                         trunk_obs=args.trunk_obs,
                          cache_bytes=args.cache_bytes,
                          max_spill_bytes=args.max_spill_bytes,
                          seed=args.seed))
@@ -329,6 +371,76 @@ def make_parser():
     td.add_argument("--max-spill-bytes", type=int, default=1 << 30)
     td.add_argument("--seed", type=int, default=31)
     td.set_defaults(func=cmd_topo_diag)
+
+    # ---- inspection coverage reconciliation ---------------------------
+    ic = sub.add_parser("inspcov", help="inspection coverage reconciliation "
+                                        "(two receipt cutoffs, one report "
+                                        "window, per-edge ledgers + diff)")
+    icsub = ic.add_subparsers(dest="inspcov_command", required=True)
+
+    icb = icsub.add_parser(
+        "build", help="reproduce the coverage ledger at two receipt "
+                      "cutoffs and reconcile them (disk bounded)")
+    icb.add_argument("--topology", required=True,
+                     help="committed topology directory (the edge roster)")
+    icb.add_argument("--registry", required=True,
+                     help="chainage registry JSONL: source_id, part_index, "
+                          "chainage_end per managed edge")
+    icb.add_argument("--inspections", required=True, nargs="+",
+                     help="one or more unordered UTF-8 JSONL inspection "
+                          "revision files")
+    icb.add_argument("--date-from", required=True, dest="date_from",
+                     help="report window start YYYY-MM-DD (inclusive)")
+    icb.add_argument("--date-to", required=True, dest="date_to",
+                     help="report window end YYYY-MM-DD (exclusive)")
+    icb.add_argument("--cutoff-before", required=True, type=int,
+                     dest="cutoff_before",
+                     help="earlier receipt batch cutoff (>= 0)")
+    icb.add_argument("--cutoff-after", required=True, type=int,
+                     dest="cutoff_after",
+                     help="later receipt batch cutoff (>= cutoff-before)")
+    icb.add_argument("--out", required=True,
+                     help="reconciliation output directory")
+    icb.add_argument("--cache-bytes", type=int, default=64 << 20,
+                     help="in-memory budget: sort chunks, sweep heaps and "
+                          "profile stores")
+    icb.add_argument("--max-spill-bytes", type=int, default=1 << 30,
+                     help="hard on-disk spill budget; exhaustion fails the "
+                          "build instead of publishing a partial report")
+    icb.add_argument("--force", action="store_true")
+    icb.set_defaults(func=cmd_inspcov_build)
+
+    icv = icsub.add_parser(
+        "validate", help="full reconciliation validation: hashes, order, "
+                         "complete tiling, diff<->ledger consistency, "
+                         "summary totals")
+    icv.add_argument("--coverage", required=True)
+    icv.add_argument("--registry", help="registry path (defaults to the "
+                                        "path pinned in the manifest)")
+    icv.add_argument("--topology", help="topology path (defaults to the "
+                                        "path pinned in the manifest)")
+    icv.add_argument("--no-registry", action="store_true",
+                     help="skip the optional registry re-derivation check")
+    icv.add_argument("--no-topology", action="store_true",
+                     help="skip the optional topology re-identity check")
+    icv.set_defaults(func=cmd_inspcov_validate)
+
+    ici = icsub.add_parser("info", help="print the reconciliation manifest")
+    ici.add_argument("--coverage", required=True)
+    ici.set_defaults(func=cmd_inspcov_info)
+
+    icd = icsub.add_parser(
+        "diag", help="runtime-generated reconciliation diagnostics: one "
+                     "long-tail trunk, shadowed interleaved observations "
+                     "and many scattered edges, oracle-diffed")
+    icd.add_argument("--out", required=True)
+    icd.add_argument("--n-edges", type=int, default=400, dest="n_edges")
+    icd.add_argument("--trunk-obs", type=int, default=4000,
+                     dest="trunk_obs")
+    icd.add_argument("--cache-bytes", type=int, default=1 << 20)
+    icd.add_argument("--max-spill-bytes", type=int, default=1 << 30)
+    icd.add_argument("--seed", type=int, default=47)
+    icd.set_defaults(func=cmd_inspcov_diag)
     return p
 
 
@@ -344,6 +456,9 @@ def main(argv=None):
         return 2
     except TopologyError as exc:
         print("topology failed: %s" % exc, file=sys.stderr)
+        return 2
+    except InspectionError as exc:
+        print("inspection reconciliation failed: %s" % exc, file=sys.stderr)
         return 2
     except CatalogError as exc:
         print("error: %s" % exc, file=sys.stderr)
